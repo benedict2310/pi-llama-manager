@@ -1,0 +1,29 @@
+{
+  "name": "pi-llama-manager",
+  "version": "0.1.0",
+  "description": "Pi extension to manage local llama.cpp servers and GGUF model selection",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "llama.cpp",
+    "llama-server",
+    "gguf"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benedict2310/pi-llama-manager.git"
+  },
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./pi-extensions"
+    ]
+  },
+  "scripts": {
+    "test": "node --test tests/llama-manager-lib.test.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

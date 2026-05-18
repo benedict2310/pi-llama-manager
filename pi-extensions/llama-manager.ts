@@ -149,12 +149,12 @@ type LlamaManagerConfig = {
   port: number;
   modelsRoots: string[];
   defaultModelPath?: string;
+  downloadDir?: string;
   logFile: string;
   stableToolCalling: boolean;
   defaultArgs: LlamaDefaults;
   extraArgs: string[];
 };
-
 type RunningServer = {
   pid: number;
   command: string;
@@ -184,6 +184,7 @@ function defaultConfig(): LlamaManagerConfig {
     port: 8080,
     modelsRoots: [path.join(os.homedir(), "models")],
     defaultModelPath: "",
+    downloadDir: path.join(os.homedir(), "models"),
     logFile: path.join(os.homedir(), ".pi", "agent", "llama-server.log"),
     stableToolCalling: true,
     defaultArgs: {
@@ -218,6 +219,7 @@ async function loadConfig(): Promise<LlamaManagerConfig> {
         ? parsed.modelsRoots.map((v) => expandHome(String(v)))
         : defaults.modelsRoots,
       defaultModelPath: parsed.defaultModelPath ? expandHome(String(parsed.defaultModelPath)) : defaults.defaultModelPath,
+      downloadDir: parsed.downloadDir ? expandHome(String(parsed.downloadDir)) : defaults.downloadDir,
       logFile: parsed.logFile ? expandHome(String(parsed.logFile)) : defaults.logFile,
       stableToolCalling: parsed.stableToolCalling ?? defaults.stableToolCalling,
       defaultArgs: {
@@ -362,6 +364,57 @@ function resolveUserModelPath(input: string, cwd?: string): string {
   return path.resolve(cwd || process.cwd(), expanded);
 }
 
+function inferFilenameFromUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const base = parsed.pathname.split("/").pop() || "";
+    return decodeURIComponent(base);
+  } catch {
+    return "";
+  }
+}
+
+function buildCurlDownloadCommand(url: string, targetPath: string): string {
+  return `curl -L --fail --progress-bar -C - -o ${shellQuote(targetPath)} ${shellQuote(url)}`;
+}
+
+async function downloadModelFromUrl(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  config: LlamaManagerConfig,
+  url: string,
+  destinationDir?: string,
+): Promise<{ ok: boolean; message: string; targetPath?: string }> {
+  const cleanedUrl = url.trim();
+  if (!cleanedUrl) return { ok: false, message: "Download URL is required" };
+
+  const inferred = inferFilenameFromUrl(cleanedUrl);
+  const fileName = inferred || "model.gguf";
+  const resolvedDir = resolveUserModelPath(destinationDir || config.downloadDir || config.modelsRoots[0] || "~/models", ctx.cwd);
+  const targetPath = path.join(resolvedDir, fileName);
+
+  await fs.mkdir(resolvedDir, { recursive: true });
+
+  if (await fileExists(targetPath)) {
+    return { ok: false, message: `File already exists: ${targetPath}` };
+  }
+
+  const command = buildCurlDownloadCommand(cleanedUrl, targetPath);
+  const result = await pi.exec("bash", ["-lc", command]);
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      message: result.stderr || result.stdout || "Download failed",
+    };
+  }
+
+  if (!(await fileExists(targetPath))) {
+    return { ok: false, message: `Download finished but file is missing: ${targetPath}` };
+  }
+
+  return { ok: true, message: `Downloaded model to ${targetPath}`, targetPath };
+}
+
 function buildStartCommand(config: LlamaManagerConfig, modelPath: string): string {
   const args = buildLlamaArgs(config, modelPath);
   const cmd = ["nohup", "llama-server", ...args]
@@ -466,6 +519,7 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
       "Restart",
       "Start with model…",
       "Set default model…",
+      "Download model from URL…",
       "Open config path",
       "Tail logs",
     ]);
@@ -537,6 +591,26 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
       continue;
     }
 
+    if (choice === "Download model from URL…") {
+      const url = await ctx.ui.input("Model URL (.gguf)", "");
+      if (!url?.trim()) continue;
+
+      const destination = await ctx.ui.input(
+        "Destination directory",
+        config.downloadDir || config.modelsRoots[0] || "~/models",
+      );
+      if (!destination?.trim()) continue;
+
+      const result = await downloadModelFromUrl(ctx, pi, config, url, destination);
+      ctx.ui.notify(result.message, result.ok ? "info" : "error");
+
+      if (result.ok && destination.trim()) {
+        config.downloadDir = destination.trim();
+        await saveConfig(config);
+      }
+      continue;
+    }
+
     if (choice === "Open config path") {
       ctx.ui.notify(CONFIG_PATH, "info");
       continue;
@@ -600,6 +674,23 @@ async function handleArgs(args: string, ctx: ExtensionContext, pi: ExtensionAPI)
     const result = await startServer(pi, config, model);
     ctx.ui.notify(result.message, result.ok ? "info" : "error");
     await refreshStatusWidget(ctx, pi);
+    return true;
+  }
+
+  if (cmd === "download") {
+    const url = rest[0]?.trim();
+    if (!url) {
+      ctx.ui.notify("Usage: /llama download <url> [destination-dir]", "warning");
+      return true;
+    }
+    const destination = rest.length > 1 ? rest.slice(1).join(" ").trim() : undefined;
+    const result = await downloadModelFromUrl(ctx, pi, config, url, destination);
+    ctx.ui.notify(result.message, result.ok ? "info" : "error");
+
+    if (result.ok && destination) {
+      config.downloadDir = destination;
+      await saveConfig(config);
+    }
     return true;
   }
 

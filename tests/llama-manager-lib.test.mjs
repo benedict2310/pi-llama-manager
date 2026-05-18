@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildCurlDownloadCommand,
   buildLlamaArgs,
   extractModelPathFromCommand,
+  inferFilenameFromUrl,
   isLikelyMainModelPath,
   modelMatchesRequest,
   parsePiLlamaModels,
@@ -92,6 +94,29 @@ test("shellQuote escapes single quotes", () => {
 test("isLikelyMainModelPath filters mmproj files", () => {
   assert.equal(isLikelyMainModelPath("/Users/bene/models/Qwen3.6-27B.gguf"), true);
   assert.equal(isLikelyMainModelPath("/Users/bene/models/mmproj-Qwen3.6-27B-f16.gguf"), false);
+});
+
+test("inferFilenameFromUrl parses normal and query URLs", () => {
+  assert.equal(
+    inferFilenameFromUrl("https://huggingface.co/foo/bar/resolve/main/model-Q5.gguf?download=true"),
+    "model-Q5.gguf",
+  );
+  assert.equal(
+    inferFilenameFromUrl("https://example.com/models/model-f16.gguf"),
+    "model-f16.gguf",
+  );
+  assert.equal(inferFilenameFromUrl("https://example.com/models/"), "");
+});
+
+test("buildCurlDownloadCommand produces resumable curl command", () => {
+  const cmd = buildCurlDownloadCommand(
+    "https://example.com/models/model-Q5.gguf",
+    "/Users/bene/models/model-Q5.gguf",
+  );
+  assert.equal(
+    cmd,
+    "curl -L --fail --progress-bar -C - -o '/Users/bene/models/model-Q5.gguf' 'https://example.com/models/model-Q5.gguf'",
+  );
 });
 
 test("modelMatchesRequest matches absolute and basename forms", () => {

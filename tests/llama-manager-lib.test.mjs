@@ -7,6 +7,7 @@ import {
   extractModelPathFromCommand,
   inferFilenameFromUrl,
   isLikelyMainModelPath,
+  normalizeDownloadUrl,
   modelMatchesRequest,
   parsePiLlamaModels,
   parsePsLlamaLines,
@@ -94,6 +95,17 @@ test("shellQuote escapes single quotes", () => {
 test("isLikelyMainModelPath filters mmproj files", () => {
   assert.equal(isLikelyMainModelPath("/home/tester/models/Qwen3.6-27B.gguf"), true);
   assert.equal(isLikelyMainModelPath("/home/tester/models/mmproj-Qwen3.6-27B-f16.gguf"), false);
+});
+
+test("normalizeDownloadUrl rewrites huggingface blob links", () => {
+  assert.equal(
+    normalizeDownloadUrl("https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/blob/main/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"),
+    "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+  );
+  assert.equal(
+    normalizeDownloadUrl("https://example.com/models/model-Q5.gguf"),
+    "https://example.com/models/model-Q5.gguf",
+  );
 });
 
 test("inferFilenameFromUrl parses normal and query URLs", () => {

@@ -364,6 +364,22 @@ function resolveUserModelPath(input: string, cwd?: string): string {
   return path.resolve(cwd || process.cwd(), expanded);
 }
 
+function normalizeDownloadUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return "";
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname === "huggingface.co" && parsed.pathname.includes("/blob/")) {
+      parsed.pathname = parsed.pathname.replace("/blob/", "/resolve/");
+      parsed.search = "";
+    }
+    return parsed.toString();
+  } catch {
+    return trimmed;
+  }
+}
+
 function inferFilenameFromUrl(url: string): string {
   try {
     const parsed = new URL(url);
@@ -385,7 +401,7 @@ async function downloadModelFromUrl(
   url: string,
   destinationDir?: string,
 ): Promise<{ ok: boolean; message: string; targetPath?: string }> {
-  const cleanedUrl = url.trim();
+  const cleanedUrl = normalizeDownloadUrl(url);
   if (!cleanedUrl) return { ok: false, message: "Download URL is required" };
 
   const inferred = inferFilenameFromUrl(cleanedUrl);
@@ -400,6 +416,7 @@ async function downloadModelFromUrl(
   }
 
   const command = buildCurlDownloadCommand(cleanedUrl, targetPath);
+  ctx.ui.notify(`Downloading ${fileName}...`, "info");
   const result = await pi.exec("bash", ["-lc", command]);
   if (result.code !== 0) {
     return {
@@ -597,15 +614,15 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
 
       const destination = await ctx.ui.input(
         "Destination directory",
-        config.downloadDir || config.modelsRoots[0] || "~/models",
+        config.downloadDir || config.modelsRoots[0] || "~/.pi/models",
       );
-      if (!destination?.trim()) continue;
+      const destinationDir = destination?.trim() || config.downloadDir || config.modelsRoots[0] || "~/.pi/models";
 
-      const result = await downloadModelFromUrl(ctx, pi, config, url, destination);
+      const result = await downloadModelFromUrl(ctx, pi, config, url, destinationDir);
       ctx.ui.notify(result.message, result.ok ? "info" : "error");
 
-      if (result.ok && destination.trim()) {
-        config.downloadDir = destination.trim();
+      if (result.ok && destinationDir.trim()) {
+        config.downloadDir = destinationDir.trim();
         await saveConfig(config);
       }
       continue;

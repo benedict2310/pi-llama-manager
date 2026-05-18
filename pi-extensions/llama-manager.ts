@@ -182,9 +182,9 @@ function defaultConfig(): LlamaManagerConfig {
   return {
     host: "0.0.0.0",
     port: 8080,
-    modelsRoots: [path.join(os.homedir(), "models")],
+    modelsRoots: [path.join(os.homedir(), ".pi", "models")],
     defaultModelPath: "",
-    downloadDir: path.join(os.homedir(), "models"),
+    downloadDir: path.join(os.homedir(), ".pi", "models"),
     logFile: path.join(os.homedir(), ".pi", "agent", "llama-server.log"),
     stableToolCalling: true,
     defaultArgs: {

@@ -34,16 +34,16 @@ test("parsePiLlamaModels extracts llama-cpp models", () => {
 });
 
 test("extractModelPathFromCommand extracts -m argument", () => {
-  const cmd = "llama-server -m /Users/bene/models/qwen.gguf --host 0.0.0.0 --port 8080";
-  assert.equal(extractModelPathFromCommand(cmd), "/Users/bene/models/qwen.gguf");
+  const cmd = "llama-server -m /home/tester/models/qwen.gguf --host 0.0.0.0 --port 8080";
+  assert.equal(extractModelPathFromCommand(cmd), "/home/tester/models/qwen.gguf");
 });
 
 test("parsePsLlamaLines parses pid/command pairs", () => {
-  const ps = "11481 llama-server -m /Users/bene/models/qwen.gguf --host 0.0.0.0 --port 8080\n";
+  const ps = "11481 llama-server -m /home/tester/models/qwen.gguf --host 0.0.0.0 --port 8080\n";
   const rows = parsePsLlamaLines(ps);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].pid, 11481);
-  assert.equal(rows[0].modelPath, "/Users/bene/models/qwen.gguf");
+  assert.equal(rows[0].modelPath, "/home/tester/models/qwen.gguf");
   assert.equal(rows[0].port, 8080);
 });
 
@@ -63,12 +63,12 @@ test("buildLlamaArgs emits stable tool-calling flags", () => {
         topP: 0.9,
       },
     },
-    "/Users/bene/models/qwen.gguf",
+    "/home/tester/models/qwen.gguf",
   );
 
   assert.deepEqual(args, [
     "-m",
-    "/Users/bene/models/qwen.gguf",
+    "/home/tester/models/qwen.gguf",
     "--host",
     "0.0.0.0",
     "--port",
@@ -92,8 +92,8 @@ test("shellQuote escapes single quotes", () => {
 });
 
 test("isLikelyMainModelPath filters mmproj files", () => {
-  assert.equal(isLikelyMainModelPath("/Users/bene/models/Qwen3.6-27B.gguf"), true);
-  assert.equal(isLikelyMainModelPath("/Users/bene/models/mmproj-Qwen3.6-27B-f16.gguf"), false);
+  assert.equal(isLikelyMainModelPath("/home/tester/models/Qwen3.6-27B.gguf"), true);
+  assert.equal(isLikelyMainModelPath("/home/tester/models/mmproj-Qwen3.6-27B-f16.gguf"), false);
 });
 
 test("inferFilenameFromUrl parses normal and query URLs", () => {
@@ -111,26 +111,26 @@ test("inferFilenameFromUrl parses normal and query URLs", () => {
 test("buildCurlDownloadCommand produces resumable curl command", () => {
   const cmd = buildCurlDownloadCommand(
     "https://example.com/models/model-Q5.gguf",
-    "/Users/bene/models/model-Q5.gguf",
+    "/home/tester/models/model-Q5.gguf",
   );
   assert.equal(
     cmd,
-    "curl -L --fail --progress-bar -C - -o '/Users/bene/models/model-Q5.gguf' 'https://example.com/models/model-Q5.gguf'",
+    "curl -L --fail --progress-bar -C - -o '/home/tester/models/model-Q5.gguf' 'https://example.com/models/model-Q5.gguf'",
   );
 });
 
 test("modelMatchesRequest matches absolute and basename forms", () => {
   assert.equal(
     modelMatchesRequest(
-      "/Users/bene/models/qwen3.6-27b-uncensored-hauhaucs-aggressive/Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf",
-      "/Users/bene/models/qwen3.6-27b-uncensored-hauhaucs-aggressive/Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf",
+      "/home/tester/models/qwen3.6-27b-uncensored-hauhaucs-aggressive/Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf",
+      "/home/tester/models/qwen3.6-27b-uncensored-hauhaucs-aggressive/Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf",
     ),
     true,
   );
 
   assert.equal(
     modelMatchesRequest(
-      "/Users/bene/models/qwen3.6-27b-uncensored-hauhaucs-aggressive/Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf",
+      "/home/tester/models/qwen3.6-27b-uncensored-hauhaucs-aggressive/Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf",
       "Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf",
     ),
     true,
@@ -138,8 +138,8 @@ test("modelMatchesRequest matches absolute and basename forms", () => {
 
   assert.equal(
     modelMatchesRequest(
-      "/Users/bene/models/a.gguf",
-      "/Users/bene/models/b.gguf",
+      "/home/tester/models/a.gguf",
+      "/home/tester/models/b.gguf",
     ),
     false,
   );

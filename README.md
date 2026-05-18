@@ -67,9 +67,9 @@ Example:
 {
   "host": "0.0.0.0",
   "port": 8080,
-  "modelsRoots": ["/Users/you/models"],
+  "modelsRoots": ["~/.pi/models"],
   "defaultModelPath": "",
-  "downloadDir": "/Users/you/models",
+  "downloadDir": "~/.pi/models",
   "logFile": "/Users/you/.pi/agent/llama-server.log",
   "stableToolCalling": true,
   "defaultArgs": {

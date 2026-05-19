@@ -5,10 +5,13 @@ import {
   buildCurlDownloadCommand,
   buildLlamaArgs,
   extractModelPathFromCommand,
+  formatBytes,
+  formatPercent,
   inferFilenameFromUrl,
   isLikelyMainModelPath,
   normalizeDownloadUrl,
   modelMatchesRequest,
+  parseContentLengthFromHeaders,
   parsePiLlamaModels,
   parsePsLlamaLines,
   shellQuote,
@@ -129,6 +132,30 @@ test("buildCurlDownloadCommand produces resumable curl command", () => {
     cmd,
     "curl -L --fail --progress-bar -C - -o '/home/tester/models/model-Q5.gguf' 'https://example.com/models/model-Q5.gguf'",
   );
+});
+
+test("parseContentLengthFromHeaders handles common header formats", () => {
+  const headers = [
+    "HTTP/2 302",
+    "content-length: 0",
+    "",
+    "HTTP/2 200",
+    "content-length: 123456789",
+    "",
+  ].join("\n");
+
+  assert.equal(parseContentLengthFromHeaders(headers), 123456789);
+  assert.equal(parseContentLengthFromHeaders("HTTP/2 200\ncontent-type: application/octet-stream\n"), null);
+});
+
+test("formatBytes and formatPercent are user friendly", () => {
+  assert.equal(formatBytes(0), "0 B");
+  assert.equal(formatBytes(1024), "1.0 KB");
+  assert.equal(formatBytes(1024 * 1024), "1.0 MB");
+  assert.equal(formatPercent(0, 100), "0.0%");
+  assert.equal(formatPercent(50, 100), "50.0%");
+  assert.equal(formatPercent(150, 100), "100.0%");
+  assert.equal(formatPercent(0, 0), "--");
 });
 
 test("modelMatchesRequest matches absolute and basename forms", () => {

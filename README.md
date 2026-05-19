@@ -7,7 +7,9 @@ Pi extension for managing a local `llama-server` process and selecting GGUF mode
 - `/llama` interactive menu
 - `/llama status|start|stop|restart` command variants
 - Model picker from local GGUF files
-- Download additional models directly from URL (resume support)
+- Download additional models directly from URL (resume support, background)
+- Live download progress in Pi status widget
+- Abort running downloads from menu or command
 - Prevents accidental second `llama-server` instance
 - Filters out `mmproj-*.gguf` projector files from model list
 - Stable tool-calling defaults for Qwen/llama.cpp workflows
@@ -53,6 +55,8 @@ pi install https://github.com/benedict2310/pi-llama-manager
 /llama restart
 /llama start /absolute/path/to/model.gguf
 /llama download <url-to-model.gguf> [destination-dir]
+/llama download abort
+/llama download-abort
 ```
 
 ## Configuration

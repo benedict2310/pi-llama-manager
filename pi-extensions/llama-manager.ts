@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 function shellQuote(value: string): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -171,6 +172,22 @@ type ModelOption = {
 const CONFIG_PATH = path.join(os.homedir(), ".pi", "agent", "llama-manager.json");
 const PI_MODELS_PATH = path.join(os.homedir(), ".pi", "agent", "models.json");
 const STATUS_KEY = "llama-manager";
+
+type DownloadState = {
+  child: ChildProcessWithoutNullStreams;
+  fileName: string;
+  targetPath: string;
+  totalBytes: number | null;
+  downloadedBytes: number;
+  lastSampleAt: number;
+  lastSampleBytes: number;
+  bytesPerSecond: number;
+  status: "running" | "done" | "error" | "aborted";
+  error?: string;
+  pollTimer?: NodeJS.Timeout;
+};
+
+let activeDownload: DownloadState | null = null;
 
 function expandHome(input: string): string {
   if (input === "~") return os.homedir();
@@ -364,6 +381,39 @@ function resolveUserModelPath(input: string, cwd?: string): string {
   return path.resolve(cwd || process.cwd(), expanded);
 }
 
+function parseContentLengthFromHeaders(headersText: string): number | null {
+  const lines = String(headersText || "").split(/\r?\n/);
+  let contentLength: number | null = null;
+  for (const line of lines) {
+    const m = line.match(/^\s*content-length\s*:\s*(\d+)\s*$/i);
+    if (!m) continue;
+    const value = Number.parseInt(m[1]!, 10);
+    if (Number.isFinite(value)) contentLength = value;
+  }
+  return contentLength;
+}
+
+function formatBytes(bytes: number): string {
+  const n = Math.max(0, Number(bytes) || 0);
+  if (n < 1024) return `${Math.round(n)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = n / 1024;
+  let unit = units[0]!;
+  for (let i = 1; i < units.length && value >= 1024; i += 1) {
+    value /= 1024;
+    unit = units[i]!;
+  }
+  return `${value.toFixed(1)} ${unit}`;
+}
+
+function formatPercent(done: number, total: number | null): string {
+  const d = Math.max(0, Number(done) || 0);
+  const t = Number(total) || 0;
+  if (!Number.isFinite(t) || t <= 0) return "--";
+  const pct = Math.min(100, (d / t) * 100);
+  return `${pct.toFixed(1)}%`;
+}
+
 function normalizeDownloadUrl(url: string): string {
   const trimmed = url.trim();
   if (!trimmed) return "";
@@ -394,6 +444,59 @@ function buildCurlDownloadCommand(url: string, targetPath: string): string {
   return `curl -L --fail --progress-bar -C - -o ${shellQuote(targetPath)} ${shellQuote(url)}`;
 }
 
+async function fetchRemoteContentLength(pi: ExtensionAPI, url: string): Promise<number | null> {
+  const cmd = `curl -sIL ${shellQuote(url)}`;
+  const result = await pi.exec("bash", ["-lc", cmd]);
+  if (result.code !== 0) return null;
+  return parseContentLengthFromHeaders(result.stdout || "");
+}
+
+async function updateDownloadProgress(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  if (!activeDownload || activeDownload.status !== "running") {
+    await refreshStatusWidget(ctx, pi);
+    return;
+  }
+
+  try {
+    const st = await fs.stat(activeDownload.targetPath);
+    const now = Date.now();
+    const elapsedSec = Math.max(0.001, (now - activeDownload.lastSampleAt) / 1000);
+    const delta = Math.max(0, st.size - activeDownload.lastSampleBytes);
+
+    activeDownload.downloadedBytes = st.size;
+    activeDownload.bytesPerSecond = delta / elapsedSec;
+    activeDownload.lastSampleAt = now;
+    activeDownload.lastSampleBytes = st.size;
+  } catch {
+    // file may not exist yet at the very beginning
+  }
+
+  await refreshStatusWidget(ctx, pi);
+}
+
+function clearDownloadTimer() {
+  if (activeDownload?.pollTimer) {
+    clearInterval(activeDownload.pollTimer);
+    activeDownload.pollTimer = undefined;
+  }
+}
+
+async function abortActiveDownload(ctx: ExtensionContext, pi: ExtensionAPI): Promise<{ ok: boolean; message: string }> {
+  if (!activeDownload || activeDownload.status !== "running") {
+    return { ok: false, message: "No active download to abort" };
+  }
+
+  activeDownload.status = "aborted";
+  try {
+    activeDownload.child.kill("SIGINT");
+  } catch {
+    // ignore
+  }
+  clearDownloadTimer();
+  await refreshStatusWidget(ctx, pi);
+  return { ok: true, message: `Aborted download: ${activeDownload.fileName}` };
+}
+
 async function downloadModelFromUrl(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
@@ -401,12 +504,16 @@ async function downloadModelFromUrl(
   url: string,
   destinationDir?: string,
 ): Promise<{ ok: boolean; message: string; targetPath?: string }> {
+  if (activeDownload && activeDownload.status === "running") {
+    return { ok: false, message: `Another download is running: ${activeDownload.fileName}` };
+  }
+
   const cleanedUrl = normalizeDownloadUrl(url);
   if (!cleanedUrl) return { ok: false, message: "Download URL is required" };
 
   const inferred = inferFilenameFromUrl(cleanedUrl);
   const fileName = inferred || "model.gguf";
-  const resolvedDir = resolveUserModelPath(destinationDir || config.downloadDir || config.modelsRoots[0] || "~/models", ctx.cwd);
+  const resolvedDir = resolveUserModelPath(destinationDir || config.downloadDir || config.modelsRoots[0] || "~/.pi/models", ctx.cwd);
   const targetPath = path.join(resolvedDir, fileName);
 
   await fs.mkdir(resolvedDir, { recursive: true });
@@ -415,21 +522,68 @@ async function downloadModelFromUrl(
     return { ok: false, message: `File already exists: ${targetPath}` };
   }
 
+  const totalBytes = await fetchRemoteContentLength(pi, cleanedUrl);
   const command = buildCurlDownloadCommand(cleanedUrl, targetPath);
-  ctx.ui.notify(`Downloading ${fileName}...`, "info");
-  const result = await pi.exec("bash", ["-lc", command]);
-  if (result.code !== 0) {
-    return {
-      ok: false,
-      message: result.stderr || result.stdout || "Download failed",
-    };
-  }
 
-  if (!(await fileExists(targetPath))) {
-    return { ok: false, message: `Download finished but file is missing: ${targetPath}` };
-  }
+  const child = spawn("bash", ["-lc", command], {
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+  });
 
-  return { ok: true, message: `Downloaded model to ${targetPath}`, targetPath };
+  activeDownload = {
+    child,
+    fileName,
+    targetPath,
+    totalBytes,
+    downloadedBytes: 0,
+    lastSampleAt: Date.now(),
+    lastSampleBytes: 0,
+    bytesPerSecond: 0,
+    status: "running",
+  };
+
+  activeDownload.pollTimer = setInterval(() => {
+    void updateDownloadProgress(ctx, pi);
+  }, 1000);
+
+  child.on("error", async (error) => {
+    if (!activeDownload) return;
+    activeDownload.status = "error";
+    activeDownload.error = error.message;
+    clearDownloadTimer();
+    ctx.ui.notify(`Download failed: ${error.message}`, "error");
+    await refreshStatusWidget(ctx, pi);
+  });
+
+  child.on("exit", async (code, signal) => {
+    if (!activeDownload) return;
+
+    const wasRunning = activeDownload.status === "running";
+    if (activeDownload.status === "aborted") {
+      ctx.ui.notify(`Download aborted: ${fileName}`, "warning");
+    } else if (code === 0) {
+      activeDownload.status = "done";
+      ctx.ui.notify(`Download complete: ${targetPath}`, "info");
+    } else if (wasRunning) {
+      activeDownload.status = "error";
+      const reason = signal ? `signal ${signal}` : `exit code ${code}`;
+      ctx.ui.notify(`Download failed: ${reason}`, "error");
+    }
+
+    clearDownloadTimer();
+    await updateDownloadProgress(ctx, pi);
+
+    setTimeout(async () => {
+      if (activeDownload && activeDownload.status !== "running") {
+        activeDownload = null;
+        await refreshStatusWidget(ctx, pi);
+      }
+    }, 5000);
+  });
+
+  ctx.ui.notify(`Download started in background: ${fileName}`, "info");
+  await refreshStatusWidget(ctx, pi);
+  return { ok: true, message: `Download started: ${targetPath}`, targetPath };
 }
 
 function buildStartCommand(config: LlamaManagerConfig, modelPath: string): string {
@@ -485,9 +639,30 @@ function statusSummary(servers: RunningServer[]): string {
   return `llama.cpp: running (${model} @ :${port})`;
 }
 
+function downloadStatusSummary(download: DownloadState | null): string {
+  if (!download) return "";
+
+  if (download.status === "aborted") {
+    return ` | download: aborted (${download.fileName})`;
+  }
+  if (download.status === "error") {
+    return ` | download: error (${download.fileName})`;
+  }
+  if (download.status === "done") {
+    return ` | download: done (${download.fileName})`;
+  }
+
+  const pct = formatPercent(download.downloadedBytes, download.totalBytes);
+  const done = formatBytes(download.downloadedBytes);
+  const total = download.totalBytes ? formatBytes(download.totalBytes) : "?";
+  const speed = download.bytesPerSecond > 0 ? ` @ ${formatBytes(download.bytesPerSecond)}/s` : "";
+  return ` | download: ${download.fileName} ${pct} (${done}/${total})${speed}`;
+}
+
 function setStatusWidget(ctx: ExtensionContext, servers: RunningServer[]): void {
   if (!ctx.hasUI) return;
-  ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", statusSummary(servers)));
+  const text = `${statusSummary(servers)}${downloadStatusSummary(activeDownload)}`;
+  ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", text));
 }
 
 async function refreshStatusWidget(ctx: ExtensionContext, pi: ExtensionAPI): Promise<RunningServer[]> {
@@ -537,6 +712,7 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
       "Start with model…",
       "Set default model…",
       "Download model from URL…",
+      "Abort active download",
       "Open config path",
       "Tail logs",
     ]);
@@ -628,6 +804,12 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
       continue;
     }
 
+    if (choice === "Abort active download") {
+      const result = await abortActiveDownload(ctx, pi);
+      ctx.ui.notify(result.message, result.ok ? "info" : "warning");
+      continue;
+    }
+
     if (choice === "Open config path") {
       ctx.ui.notify(CONFIG_PATH, "info");
       continue;
@@ -695,9 +877,15 @@ async function handleArgs(args: string, ctx: ExtensionContext, pi: ExtensionAPI)
   }
 
   if (cmd === "download") {
+    if (rest[0]?.trim() === "abort") {
+      const aborted = await abortActiveDownload(ctx, pi);
+      ctx.ui.notify(aborted.message, aborted.ok ? "info" : "warning");
+      return true;
+    }
+
     const url = rest[0]?.trim();
     if (!url) {
-      ctx.ui.notify("Usage: /llama download <url> [destination-dir]", "warning");
+      ctx.ui.notify("Usage: /llama download <url> [destination-dir] | /llama download abort", "warning");
       return true;
     }
     const destination = rest.length > 1 ? rest.slice(1).join(" ").trim() : undefined;
@@ -708,6 +896,12 @@ async function handleArgs(args: string, ctx: ExtensionContext, pi: ExtensionAPI)
       config.downloadDir = destination;
       await saveConfig(config);
     }
+    return true;
+  }
+
+  if (cmd === "download-abort") {
+    const aborted = await abortActiveDownload(ctx, pi);
+    ctx.ui.notify(aborted.message, aborted.ok ? "info" : "warning");
     return true;
   }
 

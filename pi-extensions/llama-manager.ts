@@ -3,6 +3,21 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  LLAMA_SERVER_PROFILES,
+  buildLlamaArgs as buildManagedLlamaArgs,
+  derivePiModelIdFromPath,
+  findModelPathForPiModelId,
+  formatPiModelBaseUrl,
+  loadPiModelsRegistry,
+  normalizeLlamaProfileName,
+  parseLlamaServerLogMetrics,
+  profileSyncDefaults,
+  assessLaunchMetrics,
+  createLaunchRecord,
+  savePiModelsRegistry,
+  syncPiModelsRegistryData,
+} from "../lib/llama-manager-lib.js";
 function shellQuote(value: string): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -96,31 +111,7 @@ function parsePsLlamaLines(output: string): Array<{ pid: number; command: string
 }
 
 function buildLlamaArgs(config: LlamaManagerConfig, modelPath: string): string[] {
-  const args = [
-    "-m",
-    modelPath,
-    "--host",
-    String(config.host ?? "127.0.0.1"),
-    "--port",
-    String(config.port ?? 8080),
-  ];
-
-  if (config?.stableToolCalling && config?.defaultArgs?.jinja) args.push("--jinja");
-  if (config?.stableToolCalling && config?.defaultArgs?.reasoning) {
-    args.push("--reasoning", String(config.defaultArgs.reasoning));
-  }
-  if (config?.stableToolCalling && config?.defaultArgs?.chatTemplateKwargs) {
-    args.push("--chat-template-kwargs", JSON.stringify(config.defaultArgs.chatTemplateKwargs));
-  }
-  if (config?.stableToolCalling && typeof config?.defaultArgs?.temp === "number") {
-    args.push("--temp", String(config.defaultArgs.temp));
-  }
-  if (config?.stableToolCalling && typeof config?.defaultArgs?.topP === "number") {
-    args.push("--top-p", String(config.defaultArgs.topP));
-  }
-  if (Array.isArray(config?.extraArgs)) args.push(...config.extraArgs.map((part) => String(part)));
-
-  return args;
+  return buildManagedLlamaArgs(config, modelPath);
 }
 
 function modelMatchesRequest(runningModelPath?: string, requestedModelPath?: string): boolean {
@@ -145,6 +136,12 @@ type LlamaDefaults = {
   topP: number;
 };
 
+type PiModelSyncDefaults = {
+  contextWindow: number;
+  maxTokens: number;
+  reasoning: boolean;
+};
+
 type LlamaManagerConfig = {
   host: string;
   port: number;
@@ -152,7 +149,13 @@ type LlamaManagerConfig = {
   defaultModelPath?: string;
   downloadDir?: string;
   logFile: string;
+  launchHistoryFile: string;
   stableToolCalling: boolean;
+  autoSyncPiModels: boolean;
+  autoSelectAfterStart: boolean;
+  autoSwitchOnModelSelect: boolean;
+  serverProfile: "fast" | "code" | "deep" | "wide";
+  syncDefaults: PiModelSyncDefaults;
   defaultArgs: LlamaDefaults;
   extraArgs: string[];
 };
@@ -197,13 +200,19 @@ function expandHome(input: string): string {
 
 function defaultConfig(): LlamaManagerConfig {
   return {
-    host: "0.0.0.0",
+    host: "127.0.0.1",
     port: 8080,
     modelsRoots: [path.join(os.homedir(), ".pi", "models")],
     defaultModelPath: "",
     downloadDir: path.join(os.homedir(), ".pi", "models"),
     logFile: path.join(os.homedir(), ".pi", "agent", "llama-server.log"),
+    launchHistoryFile: path.join(os.homedir(), ".pi", "agent", "llama-launch-history.jsonl"),
     stableToolCalling: true,
+    autoSyncPiModels: true,
+    autoSelectAfterStart: false,
+    autoSwitchOnModelSelect: false,
+    serverProfile: "code",
+    syncDefaults: profileSyncDefaults("code"),
     defaultArgs: {
       jinja: true,
       reasoning: "off",
@@ -229,6 +238,8 @@ async function loadConfig(): Promise<LlamaManagerConfig> {
   try {
     const raw = await fs.readFile(CONFIG_PATH, "utf8");
     const parsed = JSON.parse(raw) as Partial<LlamaManagerConfig>;
+    const serverProfile = normalizeLlamaProfileName((parsed as any).serverProfile) as "fast" | "code" | "deep" | "wide";
+    const parsedSyncDefaults = parsed.syncDefaults ?? profileSyncDefaults(serverProfile);
     return {
       host: parsed.host || defaults.host,
       port: typeof parsed.port === "number" ? parsed.port : defaults.port,
@@ -238,7 +249,23 @@ async function loadConfig(): Promise<LlamaManagerConfig> {
       defaultModelPath: parsed.defaultModelPath ? expandHome(String(parsed.defaultModelPath)) : defaults.defaultModelPath,
       downloadDir: parsed.downloadDir ? expandHome(String(parsed.downloadDir)) : defaults.downloadDir,
       logFile: parsed.logFile ? expandHome(String(parsed.logFile)) : defaults.logFile,
+      launchHistoryFile: (parsed as any).launchHistoryFile ? expandHome(String((parsed as any).launchHistoryFile)) : defaults.launchHistoryFile,
       stableToolCalling: parsed.stableToolCalling ?? defaults.stableToolCalling,
+      autoSyncPiModels: parsed.autoSyncPiModels ?? defaults.autoSyncPiModels,
+      autoSelectAfterStart: parsed.autoSelectAfterStart ?? defaults.autoSelectAfterStart,
+      autoSwitchOnModelSelect: (parsed as any).autoSwitchOnModelSelect ?? defaults.autoSwitchOnModelSelect,
+      serverProfile,
+      syncDefaults: {
+        contextWindow: typeof parsedSyncDefaults.contextWindow === "number"
+          ? parsedSyncDefaults.contextWindow
+          : defaults.syncDefaults.contextWindow,
+        maxTokens: typeof parsedSyncDefaults.maxTokens === "number"
+          ? parsedSyncDefaults.maxTokens
+          : defaults.syncDefaults.maxTokens,
+        reasoning: typeof parsedSyncDefaults.reasoning === "boolean"
+          ? parsedSyncDefaults.reasoning
+          : defaults.syncDefaults.reasoning,
+      },
       defaultArgs: {
         ...defaults.defaultArgs,
         ...(parsed.defaultArgs ?? {}),
@@ -255,6 +282,159 @@ async function loadConfig(): Promise<LlamaManagerConfig> {
 async function saveConfig(config: LlamaManagerConfig): Promise<void> {
   await fs.mkdir(path.dirname(CONFIG_PATH), { recursive: true });
   await fs.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+}
+
+function getPiModelBaseUrl(config: LlamaManagerConfig): string {
+  return formatPiModelBaseUrl(config.host, config.port);
+}
+
+function getServerBaseUrl(config: LlamaManagerConfig): string {
+  return getPiModelBaseUrl(config).replace(/\/v1$/, "");
+}
+
+function getSyncDefaults(config: LlamaManagerConfig): PiModelSyncDefaults {
+  const profileDefaults = profileSyncDefaults(config.serverProfile);
+  return {
+    contextWindow: config.syncDefaults?.contextWindow ?? profileDefaults.contextWindow,
+    maxTokens: config.syncDefaults?.maxTokens ?? profileDefaults.maxTokens,
+    reasoning: config.syncDefaults?.reasoning ?? false,
+  };
+}
+
+function formatSyncError(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error);
+}
+
+async function syncPiRegistryForPaths(
+  ctx: ExtensionContext,
+  config: LlamaManagerConfig,
+  modelPaths: string[],
+  options?: { force?: boolean; notifyPerModel?: boolean },
+): Promise<ReturnType<typeof syncPiModelsRegistryData> | null> {
+  if ((!config.autoSyncPiModels && !options?.force) || modelPaths.length === 0) {
+    return null;
+  }
+
+  try {
+    const registry = await loadPiModelsRegistry(PI_MODELS_PATH);
+    const result = syncPiModelsRegistryData(registry, {
+      modelPaths,
+      baseUrl: getPiModelBaseUrl(config),
+      defaults: getSyncDefaults(config),
+    });
+    await savePiModelsRegistry(PI_MODELS_PATH, result.registry);
+
+    if (options?.notifyPerModel !== false) {
+      for (const model of result.syncedModels) {
+        ctx.ui.notify(`Synced model to Pi registry: ${model.id}`, "info");
+      }
+    }
+
+    return result;
+  } catch (error) {
+    ctx.ui.notify(`Pi models registry sync failed: ${formatSyncError(error)}`, "warning");
+    return null;
+  }
+}
+
+async function syncStartedModelToPiRegistry(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  config: LlamaManagerConfig,
+  modelPath: string,
+): Promise<void> {
+  if (!isLikelyMainModelPath(modelPath)) return;
+
+  const syncResult = await syncPiRegistryForPaths(ctx, config, [modelPath]);
+  if (!config.autoSelectAfterStart) return;
+
+  const setModel = (pi as any)?.setModel;
+  if (typeof setModel !== "function") {
+    ctx.ui.notify("Auto-select after start is unavailable in this Pi runtime", "warning");
+    return;
+  }
+
+  const synced = syncResult?.syncedModels[0];
+  const defaults = getSyncDefaults(config);
+  const modelId = synced?.id || derivePiModelIdFromPath(modelPath);
+  const modelName = synced?.name || `${modelId} (llama.cpp)`;
+
+  try {
+    await setModel.call(pi, {
+      id: modelId,
+      name: modelName,
+      api: "openai-completions",
+      provider: "llama-cpp",
+      baseUrl: getPiModelBaseUrl(config),
+      reasoning: defaults.reasoning,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: defaults.contextWindow,
+      maxTokens: defaults.maxTokens,
+      compat: {
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: false,
+        supportsUsageInStreaming: false,
+        maxTokensField: "max_tokens",
+      },
+    });
+    ctx.ui.notify(`Selected Pi model: ${modelId}`, "info");
+  } catch (error) {
+    ctx.ui.notify(`Could not auto-select Pi model: ${formatSyncError(error)}`, "warning");
+  }
+}
+
+async function collectMainModelPaths(config: LlamaManagerConfig): Promise<string[]> {
+  const discovered = new Set<string>();
+  for (const root of config.modelsRoots) {
+    const files = await listGgufFiles(root);
+    for (const file of files) {
+      const resolved = path.resolve(file);
+      if (isLikelyMainModelPath(resolved)) discovered.add(resolved);
+    }
+  }
+  return [...discovered].sort();
+}
+
+async function syncAllDiscoveredModels(
+  ctx: ExtensionContext,
+  config: LlamaManagerConfig,
+): Promise<ReturnType<typeof syncPiModelsRegistryData> | null> {
+  return syncPiRegistryForPaths(ctx, config, await collectMainModelPaths(config), {
+    force: true,
+    notifyPerModel: false,
+  });
+}
+
+async function switchServerForSelectedPiModel(
+  event: { model?: { provider?: string; id?: string }; source?: string },
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+): Promise<void> {
+  if (event.model?.provider !== "llama-cpp") return;
+
+  const modelId = event.model.id || "";
+  const config = await loadConfig();
+  if (!config.autoSwitchOnModelSelect) {
+    ctx.ui.notify(`llama.cpp auto-switch is disabled. Use /llama start or /llama restart for ${modelId}.`, "info");
+    return;
+  }
+  const modelPath = findModelPathForPiModelId(modelId, await collectMainModelPaths(config));
+  if (!modelPath) {
+    ctx.ui.notify(`No local GGUF path found for llama.cpp model: ${modelId}`, "warning");
+    return;
+  }
+
+  const running = await getRunningServers(pi);
+  if (running.length > 0 && !running.some((server) => modelMatchesRequest(server.modelPath, modelPath))) {
+    ctx.ui.notify(`Switching llama-server to ${path.basename(modelPath)}…`, "info");
+    await stopServers(pi, running);
+  }
+
+  const result = await startServer(ctx, pi, config, modelPath);
+  ctx.ui.notify(result.message, result.ok ? "info" : "error");
+  await refreshStatusWidget(ctx, pi);
 }
 
 async function listGgufFiles(root: string, maxDepth = 8): Promise<string[]> {
@@ -564,6 +744,7 @@ async function downloadModelFromUrl(
     } else if (code === 0) {
       activeDownload.status = "done";
       ctx.ui.notify(`Download complete: ${targetPath}`, "info");
+      await syncPiRegistryForPaths(ctx, config, [targetPath]);
     } else if (wasRunning) {
       activeDownload.status = "error";
       const reason = signal ? `signal ${signal}` : `exit code ${code}`;
@@ -586,19 +767,83 @@ async function downloadModelFromUrl(
   return { ok: true, message: `Download started: ${targetPath}`, targetPath };
 }
 
-function buildStartCommand(config: LlamaManagerConfig, modelPath: string): string {
+function buildStartCommand(config: LlamaManagerConfig, modelPath: string, logFile = config.logFile): string {
   const args = buildLlamaArgs(config, modelPath);
   const cmd = ["nohup", "llama-server", ...args]
     .map((part) => shellQuote(part))
     .join(" ");
-  return `${cmd} > ${shellQuote(config.logFile)} 2>&1 & echo $!`;
+  return `${cmd} >> ${shellQuote(logFile)} 2>&1 & echo $!`;
 }
 
-async function startServer(pi: ExtensionAPI, config: LlamaManagerConfig, modelPath: string): Promise<{ ok: boolean; message: string }> {
+function timestampForFile(date = new Date()): string {
+  return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+function buildLaunchLogPath(config: LlamaManagerConfig, date = new Date()): string {
+  const directory = path.join(path.dirname(config.logFile), "llama-server-runs");
+  return path.join(directory, `llama-server-${timestampForFile(date)}.log`);
+}
+
+async function pointCurrentLogAtLaunch(config: LlamaManagerConfig, launchLogFile: string): Promise<void> {
+  await fs.mkdir(path.dirname(launchLogFile), { recursive: true });
+  await fs.mkdir(path.dirname(config.logFile), { recursive: true });
+  try {
+    const stat = await fs.lstat(config.logFile);
+    if (stat.isSymbolicLink()) {
+      await fs.unlink(config.logFile);
+    } else if (stat.isFile()) {
+      await fs.rename(config.logFile, `${config.logFile}.legacy-${timestampForFile()}`);
+    }
+  } catch (error) {
+    if ((error as any)?.code !== "ENOENT") throw error;
+  }
+  await fs.symlink(launchLogFile, config.logFile);
+}
+
+async function appendLaunchHistory(config: LlamaManagerConfig, record: Record<string, unknown>): Promise<void> {
+  await fs.mkdir(path.dirname(config.launchHistoryFile), { recursive: true });
+  await fs.appendFile(config.launchHistoryFile, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+async function readLastLaunchRecord(config: LlamaManagerConfig): Promise<any | null> {
+  try {
+    const raw = await fs.readFile(config.launchHistoryFile, "utf8");
+    const line = raw.trim().split(/\r?\n/).filter(Boolean).at(-1);
+    return line ? JSON.parse(line) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readLaunchMetrics(logFile: string): Promise<Record<string, unknown>> {
+  try {
+    return parseLlamaServerLogMetrics(await fs.readFile(logFile, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+async function writeLaunchHeader(logFile: string, record: Record<string, unknown>): Promise<void> {
+  await fs.writeFile(logFile, [
+    `# pi-llama-manager launch ${record.startedAt}`,
+    `# profile: ${record.profile}`,
+    `# model: ${record.modelPath}`,
+    `# args: ${((record.args as string[]) || []).join(" ")}`,
+    "",
+  ].join("\n"), "utf8");
+}
+
+async function startServer(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  config: LlamaManagerConfig,
+  modelPath: string,
+): Promise<{ ok: boolean; message: string }> {
   const running = await getRunningServers(pi);
   if (running.length > 0) {
     const currentModel = running[0]?.modelPath || "unknown model";
     if (modelMatchesRequest(currentModel, modelPath)) {
+      await syncStartedModelToPiRegistry(ctx, pi, config, modelPath);
       return { ok: true, message: `llama-server already running requested model (${currentModel})` };
     }
     return { ok: false, message: `Refusing start: llama-server already running (${currentModel}). Use /llama restart to switch models.` };
@@ -612,19 +857,61 @@ async function startServer(pi: ExtensionAPI, config: LlamaManagerConfig, modelPa
     return { ok: false, message: `Model does not exist: ${modelPath}` };
   }
 
-  await fs.mkdir(path.dirname(config.logFile), { recursive: true });
-  const cmd = buildStartCommand(config, modelPath);
+  const startedAt = new Date().toISOString();
+  const launchLogFile = buildLaunchLogPath(config, new Date(startedAt));
+  const args = buildLlamaArgs(config, modelPath);
+  const baseRecord = createLaunchRecord({
+    startedAt,
+    profile: config.serverProfile,
+    modelPath,
+    args,
+    logFile: launchLogFile,
+    outcome: "starting",
+  });
+
+  await pointCurrentLogAtLaunch(config, launchLogFile);
+  await writeLaunchHeader(launchLogFile, baseRecord as Record<string, unknown>);
+  const cmd = buildStartCommand(config, modelPath, launchLogFile);
   const result = await pi.exec("bash", ["-lc", cmd]);
   if (result.code !== 0) {
+    const metrics = await readLaunchMetrics(launchLogFile);
+    const warnings = assessLaunchMetrics(metrics, profileSyncDefaults(config.serverProfile));
+    await appendLaunchHistory(config, createLaunchRecord({
+      ...baseRecord,
+      finishedAt: new Date().toISOString(),
+      outcome: "start-command-failed",
+      message: result.stderr || result.stdout || "Failed to start llama-server",
+      metrics,
+      warnings,
+    }));
     return { ok: false, message: result.stderr || result.stdout || "Failed to start llama-server" };
   }
 
   await new Promise((resolve) => setTimeout(resolve, 700));
   const nowRunning = await getRunningServers(pi);
+  const metrics = await readLaunchMetrics(launchLogFile);
+  const warnings = assessLaunchMetrics(metrics, profileSyncDefaults(config.serverProfile));
   if (nowRunning.length === 0) {
+    await appendLaunchHistory(config, createLaunchRecord({
+      ...baseRecord,
+      finishedAt: new Date().toISOString(),
+      outcome: "not-detected-after-start",
+      message: `Start command ran but server not detected. Check logs: ${config.logFile}`,
+      metrics,
+      warnings,
+    }));
     return { ok: false, message: `Start command ran but server not detected. Check logs: ${config.logFile}` };
   }
 
+  await appendLaunchHistory(config, createLaunchRecord({
+    ...baseRecord,
+    finishedAt: new Date().toISOString(),
+    pid: nowRunning[0].pid,
+    outcome: "started",
+    metrics,
+    warnings,
+  }));
+  await syncStartedModelToPiRegistry(ctx, pi, config, nowRunning[0].modelPath || modelPath);
   return {
     ok: true,
     message: `Started llama-server pid ${nowRunning[0].pid} with ${nowRunning[0].modelPath || modelPath}`,
@@ -683,6 +970,71 @@ async function showStatus(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void
   ctx.ui.notify(`${summary} pid=${first.pid}`, "info");
 }
 
+async function fetchServerJson(config: LlamaManagerConfig, endpoint: string): Promise<any | null> {
+  try {
+    const response = await fetch(`${getServerBaseUrl(config)}${endpoint}`, { signal: AbortSignal.timeout(3000) });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function commandHasFlag(command: string, flag: string): boolean {
+  return command.split(/\s+/).includes(flag);
+}
+
+async function showDoctor(ctx: ExtensionContext, pi: ExtensionAPI, config: LlamaManagerConfig): Promise<void> {
+  const servers = await refreshStatusWidget(ctx, pi);
+  const profileDefaults = profileSyncDefaults(config.serverProfile);
+  const profile = (LLAMA_SERVER_PROFILES as any)[config.serverProfile];
+  const props = servers.length > 0 ? await fetchServerJson(config, "/props") : null;
+  const health = servers.length > 0 ? await fetchServerJson(config, "/health") : null;
+  const runningCtx = props?.default_generation_settings?.n_ctx ?? props?.default_generation_settings?.params?.n_ctx;
+  const command = servers[0]?.command || "";
+  const lines = [
+    `llama.cpp doctor`,
+    `configured profile: ${config.serverProfile} (${profile?.label || "unknown"})`,
+    `desired context/max tokens: ${profileDefaults.contextWindow}/${profileDefaults.maxTokens}`,
+    `configured bind: ${config.host}:${config.port}`,
+    `auto-switch on Pi model select: ${config.autoSwitchOnModelSelect ? "enabled" : "disabled"}`,
+    `server: ${servers.length > 0 ? "running" : "stopped"}`,
+  ];
+
+  if (servers.length > 0) {
+    lines.push(`running model: ${props?.model_alias || path.basename(servers[0].modelPath || "unknown")}`);
+    lines.push(`running context: ${runningCtx || "unknown"}`);
+    lines.push(`health: ${health?.status || "unknown"}`);
+    lines.push(`--no-context-shift: ${commandHasFlag(command, "--no-context-shift") ? "present" : "missing"}`);
+    lines.push(`--n-predict: ${commandHasFlag(command, "--n-predict") || commandHasFlag(command, "--predict") ? "present" : "missing"}`);
+    lines.push(`note: doctor never starts or restarts llama-server`);
+  }
+
+  const logMetrics = await readLaunchMetrics(config.logFile);
+  const metricWarnings = assessLaunchMetrics(logMetrics, profileDefaults);
+  const lastLaunch = await readLastLaunchRecord(config);
+  if (Object.keys(logMetrics).length > 0) {
+    lines.push(`last log metrics: ctx=${(logMetrics as any).contextSize || "?"}, kv=${(logMetrics as any).metalKvCacheMiB || "?"} MiB, projected=${(logMetrics as any).deviceMemoryProjectedMiB || "?"}/${(logMetrics as any).deviceMemoryFreeMiB || "?"} MiB`);
+  }
+  if (lastLaunch) {
+    lines.push(`last launch: ${lastLaunch.outcome || "unknown"} profile=${lastLaunch.profile || "unknown"} log=${lastLaunch.logFile || config.logFile}`);
+  }
+  for (const warning of metricWarnings) {
+    lines.push(`${warning.level === "warning" ? "warning" : "note"}: ${warning.message}`);
+  }
+
+  ctx.ui.notify(lines.join("\n"), metricWarnings.some((warning: any) => warning.level === "warning") ? "warning" : "info");
+}
+
+async function setServerProfile(ctx: ExtensionContext, config: LlamaManagerConfig, profileName: string): Promise<void> {
+  const normalized = normalizeLlamaProfileName(profileName) as "fast" | "code" | "deep" | "wide";
+  config.serverProfile = normalized;
+  config.syncDefaults = profileSyncDefaults(normalized);
+  await saveConfig(config);
+  const profile = (LLAMA_SERVER_PROFILES as any)[normalized];
+  ctx.ui.notify(`llama profile set to ${normalized} (${profile?.contextWindow} ctx, max ${profile?.maxTokens}). Restart manually when ready.`, "info");
+}
+
 async function pickModel(ctx: ExtensionContext, config: LlamaManagerConfig): Promise<string | undefined> {
   const options = await collectModelOptions(config);
   if (options.length === 0) {
@@ -706,12 +1058,15 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
   while (true) {
     const choice = await ctx.ui.select("llama.cpp manager", [
       "Status",
+      "Doctor",
+      "Set server profile…",
       "Start (default model)",
       "Stop",
       "Restart",
       "Start with model…",
       "Set default model…",
       "Download model from URL…",
+      "Sync Pi model registry",
       "Abort active download",
       "Open config path",
       "Tail logs",
@@ -724,13 +1079,32 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
       continue;
     }
 
+    if (choice === "Doctor") {
+      await showDoctor(ctx, pi, config);
+      continue;
+    }
+
+    if (choice === "Set server profile…") {
+      const selected = await ctx.ui.select("Select llama-server profile", [
+        "fast — 8k context, safe/fast",
+        "code — 16k context, default coding profile",
+        "deep — 32k context, monitored deep investigation",
+        "wide — 128k context, high-performance profile with 1GiB prompt cache",
+      ]);
+      if (selected) {
+        await setServerProfile(ctx, config, selected.split(" ")[0] || "code");
+        config = await loadConfig();
+      }
+      continue;
+    }
+
     if (choice === "Start (default model)") {
       const model = config.defaultModelPath ? resolveUserModelPath(config.defaultModelPath, ctx.cwd) : "";
       if (!model) {
         ctx.ui.notify("No default model set. Choose 'Set default model…' first.", "warning");
         continue;
       }
-      const result = await startServer(pi, config, model);
+      const result = await startServer(ctx, pi, config, model);
       ctx.ui.notify(result.message, result.ok ? "info" : "error");
       await refreshStatusWidget(ctx, pi);
       continue;
@@ -760,7 +1134,7 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
       if (running.length > 0) {
         await stopServers(pi, running);
       }
-      const result = await startServer(pi, config, model);
+      const result = await startServer(ctx, pi, config, model);
       ctx.ui.notify(result.message, result.ok ? "info" : "error");
       await refreshStatusWidget(ctx, pi);
       continue;
@@ -769,7 +1143,7 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
     if (choice === "Start with model…") {
       const model = await pickModel(ctx, config);
       if (!model) continue;
-      const result = await startServer(pi, config, model);
+      const result = await startServer(ctx, pi, config, model);
       ctx.ui.notify(result.message, result.ok ? "info" : "error");
       await refreshStatusWidget(ctx, pi);
       continue;
@@ -800,6 +1174,17 @@ async function handleInteractive(ctx: ExtensionContext, pi: ExtensionAPI): Promi
       if (result.ok && destinationDir.trim()) {
         config.downloadDir = destinationDir.trim();
         await saveConfig(config);
+      }
+      continue;
+    }
+
+    if (choice === "Sync Pi model registry") {
+      const result = await syncAllDiscoveredModels(ctx, config);
+      if (result) {
+        ctx.ui.notify(
+          `Pi registry sync complete: ${result.counts.added} added, ${result.counts.updated} updated, ${result.counts.skipped} skipped`,
+          "info",
+        );
       }
       continue;
     }
@@ -838,6 +1223,26 @@ async function handleArgs(args: string, ctx: ExtensionContext, pi: ExtensionAPI)
     return true;
   }
 
+  if (cmd === "doctor") {
+    await showDoctor(ctx, pi, config);
+    return true;
+  }
+
+  if (cmd === "profile") {
+    const requested = rest[0]?.trim();
+    if (!requested) {
+      const profile = (LLAMA_SERVER_PROFILES as any)[config.serverProfile];
+      ctx.ui.notify(`current llama profile: ${config.serverProfile} (${profile?.contextWindow} ctx, max ${profile?.maxTokens})`, "info");
+      return true;
+    }
+    if (!(requested in (LLAMA_SERVER_PROFILES as any))) {
+      ctx.ui.notify("Usage: /llama profile fast|code|deep|wide", "warning");
+      return true;
+    }
+    await setServerProfile(ctx, config, requested);
+    return true;
+  }
+
   if (cmd === "stop") {
     const running = await getRunningServers(pi);
     await stopServers(pi, running);
@@ -854,7 +1259,7 @@ async function handleArgs(args: string, ctx: ExtensionContext, pi: ExtensionAPI)
       ctx.ui.notify("No model provided and no default model configured", "warning");
       return true;
     }
-    const result = await startServer(pi, config, model);
+    const result = await startServer(ctx, pi, config, model);
     ctx.ui.notify(result.message, result.ok ? "info" : "error");
     await refreshStatusWidget(ctx, pi);
     return true;
@@ -870,7 +1275,7 @@ async function handleArgs(args: string, ctx: ExtensionContext, pi: ExtensionAPI)
     }
     const running = await getRunningServers(pi);
     await stopServers(pi, running);
-    const result = await startServer(pi, config, model);
+    const result = await startServer(ctx, pi, config, model);
     ctx.ui.notify(result.message, result.ok ? "info" : "error");
     await refreshStatusWidget(ctx, pi);
     return true;
@@ -905,6 +1310,17 @@ async function handleArgs(args: string, ctx: ExtensionContext, pi: ExtensionAPI)
     return true;
   }
 
+  if (cmd === "sync-models") {
+    const result = await syncAllDiscoveredModels(ctx, config);
+    if (result) {
+      ctx.ui.notify(
+        `Pi registry sync complete: ${result.counts.added} added, ${result.counts.updated} updated, ${result.counts.skipped} skipped`,
+        "info",
+      );
+    }
+    return true;
+  }
+
   return false;
 }
 
@@ -915,6 +1331,10 @@ export default function llamaManagerExtension(pi: ExtensionAPI): void {
 
   pi.on("session_switch", async (_event, ctx) => {
     await refreshStatusWidget(ctx, pi);
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    await switchServerForSelectedPiModel(event, ctx, pi);
   });
 
   pi.on("turn_end", async (_event, ctx) => {
